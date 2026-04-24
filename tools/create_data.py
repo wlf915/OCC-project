@@ -163,7 +163,7 @@ def waymo_data_prep(root_path,
         max_sweeps (int): Number of input consecutive frames. Default: 5 \
             Here we store pose information of these frames for later use.
     """
-    from tools.data_converter import waymo_converter as waymo
+    from data_converter import waymo_converter as waymo
 
     splits = ['training', 'validation', 'testing']
 

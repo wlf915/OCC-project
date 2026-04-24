@@ -77,6 +77,21 @@ model = dict(
         sync_cls_avg_factor=True,
         with_box_refine=True,
         as_two_stage=False,
+        occ_head=dict(
+            ENABLED=False,
+            NUM_CONV=2,
+            INIT_BIAS=0.0,
+            LOSS_WEIGHT=1.0,
+            PER_CLASS=False,  # single-channel (binary) occupancy
+            TARGET_CLASSES=[0, 3, 4, 5, 8],  # car, bus, trailer, barrier, pedestrian
+            KL_WITH_PRED=False,
+            KL_WEIGHT=0.5,
+            KL_KIND='categorical',
+            KL_MODE='symmetric_kl',
+            KL_REDUCTION='mean',
+            KL_OCC_REDUCE='avg_bev',
+            KL_PRED_REDUCE='avg_query',
+        ),
         transformer=dict(
             type='PerceptionTransformer',
             rotate_prev_bev=True,
@@ -253,8 +268,8 @@ lr_config = dict(
     warmup_iters=500,
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3)
-total_epochs = 24
-evaluation = dict(interval=1, pipeline=test_pipeline)
+total_epochs = 26
+evaluation = dict(interval=26, pipeline=test_pipeline)
 
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 load_from = 'ckpts/r101_dcn_fcos3d_pretrain.pth'

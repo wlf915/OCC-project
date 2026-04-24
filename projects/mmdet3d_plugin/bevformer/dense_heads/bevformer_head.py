@@ -1,6 +1,8 @@
 import copy
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from mmcv.cnn import Linear, bias_init_with_prob
 from mmcv.utils import TORCH_VERSION, digit_version
@@ -11,6 +13,71 @@ from mmdet.models.dense_heads import DETRHead
 from mmdet3d.core.bbox.coders import build_bbox_coder
 from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
 from mmcv.runner import force_fp32, auto_fp16
+
+
+def _kl_bernoulli_from_logits(p_logits, q_logits, reduction='mean', eps=1e-6):
+    """KL(p||q) for independent Bernoulli variables given logits."""
+    p = torch.sigmoid(p_logits)
+    q = torch.sigmoid(q_logits)
+    p = torch.clamp(p, eps, 1 - eps)
+    q = torch.clamp(q, eps, 1 - eps)
+    kl = p * (torch.log(p) - torch.log(q)) + (1 - p) * (torch.log(1 - p) - torch.log(1 - q))
+    if reduction == 'mean':
+        return kl.mean()
+    if reduction == 'sum':
+        return kl.sum()
+    if reduction == 'batchmean':
+        batch = kl.shape[0] if kl.ndim > 0 else 1
+        return kl.sum() / max(batch, 1)
+    return kl
+
+
+def _kl_categorical_from_logits(p_logits, q_logits, dim=-1, reduction='mean'):
+    """KL(p||q) for categorical distributions given logits."""
+    p_log_prob = F.log_softmax(p_logits, dim=dim)
+    q_log_prob = F.log_softmax(q_logits, dim=dim)
+    p_prob = p_log_prob.exp()
+    kl = (p_prob * (p_log_prob - q_log_prob)).sum(dim=dim)
+    if reduction == 'mean':
+        return kl.mean()
+    if reduction == 'sum':
+        return kl.sum()
+    if reduction == 'batchmean':
+        batch = kl.shape[0] if kl.ndim > 0 else 1
+        return kl.sum() / max(batch, 1)
+    return kl
+
+
+def _js_divergence_from_logits(p_logits, q_logits, kind='bernoulli', dim=-1, reduction='mean', eps=1e-6):
+    """Jensen-Shannon divergence derived from logits."""
+    if kind == 'categorical':
+        p_log_prob = F.log_softmax(p_logits, dim=dim)
+        q_log_prob = F.log_softmax(q_logits, dim=dim)
+        p_prob = p_log_prob.exp()
+        q_prob = q_log_prob.exp()
+        m_prob = 0.5 * (p_prob + q_prob)
+        m_prob = torch.clamp(m_prob, eps, 1.0)
+        log_m = torch.log(m_prob)
+        kl_pm = (p_prob * (p_log_prob - log_m)).sum(dim=dim)
+        kl_qm = (q_prob * (q_log_prob - log_m)).sum(dim=dim)
+    else:
+        p = torch.sigmoid(p_logits)
+        q = torch.sigmoid(q_logits)
+        p = torch.clamp(p, eps, 1 - eps)
+        q = torch.clamp(q, eps, 1 - eps)
+        m = 0.5 * (p + q)
+        m = torch.clamp(m, eps, 1 - eps)
+        kl_pm = p * (torch.log(p) - torch.log(m)) + (1 - p) * (torch.log(1 - p) - torch.log(1 - m))
+        kl_qm = q * (torch.log(q) - torch.log(m)) + (1 - q) * (torch.log(1 - q) - torch.log(1 - m))
+    js = 0.5 * (kl_pm + kl_qm)
+    if reduction == 'mean':
+        return js.mean()
+    if reduction == 'sum':
+        return js.sum()
+    if reduction == 'batchmean':
+        batch = js.shape[0] if js.ndim > 0 else 1
+        return js.sum() / max(batch, 1)
+    return js
 
 
 @HEADS.register_module()
@@ -36,6 +103,7 @@ class BEVFormerHead(DETRHead):
                  code_weights=None,
                  bev_h=30,
                  bev_w=30,
+                 occ_head=None,
                  **kwargs):
 
         self.bev_h = bev_h
@@ -61,10 +129,165 @@ class BEVFormerHead(DETRHead):
         self.real_w = self.pc_range[3] - self.pc_range[0]
         self.real_h = self.pc_range[4] - self.pc_range[1]
         self.num_cls_fcs = num_cls_fcs - 1
+        # occupancy head config (optional)
+        self.occ_cfg = occ_head if isinstance(occ_head, dict) else None
+        self.with_occ = bool(self.occ_cfg and self.occ_cfg.get('ENABLED', False))
+        self.occ_loss_weight = float(self.occ_cfg.get('LOSS_WEIGHT', 0.2)) if self.with_occ else 0.0
+        self.occ_per_class = bool(self.occ_cfg.get('PER_CLASS', False)) if self.with_occ else False
+        self.occ_kl_enabled = bool(self.occ_cfg.get('KL_WITH_PRED', False)) if self.with_occ else False
+        self.occ_kl_weight = float(self.occ_cfg.get('KL_WEIGHT', 0.1)) if self.occ_kl_enabled else 0.0
+        self.occ_kl_kind = self.occ_cfg.get('KL_KIND', 'bernoulli') if self.occ_kl_enabled else 'bernoulli'
+        self.occ_kl_mode = self.occ_cfg.get('KL_MODE', 'kl') if self.occ_kl_enabled else 'kl'
+        self.occ_kl_reduction = self.occ_cfg.get('KL_REDUCTION', 'mean') if self.occ_kl_enabled else 'mean'
+        self.occ_kl_occ_reduce = self.occ_cfg.get('KL_OCC_REDUCE', 'avg_bev') if self.occ_kl_enabled else 'avg_bev'
+        self.occ_kl_pred_reduce = self.occ_cfg.get('KL_PRED_REDUCE', 'avg_query') if self.occ_kl_enabled else 'avg_query'
+        self.occ_kl_detach_occ = bool(self.occ_cfg.get('KL_DETACH_OCC', False)) if self.occ_kl_enabled else False
+        self.occ_kl_detach_pred = bool(self.occ_cfg.get('KL_DETACH_PRED', False)) if self.occ_kl_enabled else False
+        # restrict occupancy supervision to selected classes if provided
+        target_cls_cfg = self.occ_cfg.get('TARGET_CLASSES', None) if self.with_occ else None
+        if target_cls_cfg is None and self.with_occ:
+            target_cls_cfg = self.occ_cfg.get('TARGET_CLASS_IDS', None)
+        if target_cls_cfg is None:
+            self.occ_target_classes = None
+        elif isinstance(target_cls_cfg, (list, tuple)):
+            self.occ_target_classes = tuple(int(c) for c in target_cls_cfg)
+        else:
+            self.occ_target_classes = (int(target_cls_cfg),)
+
         super(BEVFormerHead, self).__init__(
             *args, transformer=transformer, **kwargs)
         self.code_weights = nn.Parameter(torch.tensor(
             self.code_weights, requires_grad=False), requires_grad=False)
+
+        # build occupancy branch if enabled
+        if self.with_occ:
+            num_convs = int(self.occ_cfg.get('NUM_CONV', 2))
+            init_bias = float(self.occ_cfg.get('INIT_BIAS', 0.0))
+            layers = []
+            in_ch = self.embed_dims
+            hid_ch = self.embed_dims
+            for _ in range(max(0, num_convs - 1)):
+                layers.append(nn.Conv2d(in_ch, hid_ch, kernel_size=3, padding=1))
+                layers.append(nn.ReLU(inplace=True))
+                in_ch = hid_ch
+            # output channels: 1 for binary, or num_classes for per-class
+            out_ch = getattr(self, 'num_classes', 1) if self.occ_per_class else 1
+            layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=1))
+            self.occ_head = nn.Sequential(*layers)
+            # init last bias
+            with torch.no_grad():
+                self.occ_head[-1].bias.fill_(init_bias)
+
+    def _reduce_occ_logits_for_kl(self, occ_logits):
+        if not self.occ_kl_enabled:
+            return None
+        reduce = self.occ_kl_occ_reduce
+        if reduce == 'avg_bev':
+            agg = occ_logits.mean(dim=(2, 3))
+        elif reduce == 'max_bev':
+            agg = occ_logits.amax(dim=(2, 3))
+        elif reduce == 'sum_bev':
+            agg = occ_logits.sum(dim=(2, 3))
+        elif reduce == 'logsumexp_bev':
+            agg = torch.logsumexp(occ_logits, dim=(2, 3))
+            area = occ_logits.shape[2] * occ_logits.shape[3]
+            if area > 0:
+                agg = agg - math.log(float(area))
+        else:
+            raise ValueError(f'Unsupported KL_OCC_REDUCE: {reduce}')
+        return agg
+
+    def _reduce_pred_logits_for_kl(self, cls_logits):
+        if not self.occ_kl_enabled:
+            return None
+        reduce = self.occ_kl_pred_reduce
+        if reduce == 'avg_query':
+            agg = cls_logits.mean(dim=1)
+        elif reduce == 'max_query':
+            agg = cls_logits.amax(dim=1)
+        elif reduce == 'sum_query':
+            agg = cls_logits.sum(dim=1)
+        elif reduce == 'logsumexp_query':
+            agg = torch.logsumexp(cls_logits, dim=1)
+            count = cls_logits.shape[1]
+            if count > 0:
+                agg = agg - math.log(float(count))
+        else:
+            raise ValueError(f'Unsupported KL_PRED_REDUCE: {reduce}')
+        return agg
+
+    def _compute_occ_pred_kl(self, occ_logits, preds_dicts):
+        if not self.occ_kl_enabled:
+            return None
+        if 'all_cls_scores' not in preds_dicts or preds_dicts['all_cls_scores'] is None:
+            return None
+        cls_logits_last = preds_dicts['all_cls_scores'][-1]
+        if cls_logits_last is None:
+            return None
+        occ_vec_logits = self._reduce_occ_logits_for_kl(occ_logits)
+        pred_vec_logits = self._reduce_pred_logits_for_kl(cls_logits_last)
+        if occ_vec_logits is None or pred_vec_logits is None:
+            return None
+
+        # align shapes (B, C) or (B, 1)
+        if not self.occ_per_class:
+            if occ_vec_logits.dim() > 1:
+                occ_vec_logits = occ_vec_logits.mean(dim=-1, keepdim=True)
+            if pred_vec_logits.dim() > 1:
+                pred_vec_logits = torch.logsumexp(pred_vec_logits, dim=-1, keepdim=True)
+        else:
+            # truncate/expand pred logits if mismatch (e.g., extra background)
+            if pred_vec_logits.shape[-1] != occ_vec_logits.shape[-1]:
+                min_c = min(pred_vec_logits.shape[-1], occ_vec_logits.shape[-1])
+                pred_vec_logits = pred_vec_logits[..., :min_c]
+                occ_vec_logits = occ_vec_logits[..., :min_c]
+
+        if self.occ_kl_detach_occ:
+            occ_vec_logits = occ_vec_logits.detach()
+        if self.occ_kl_detach_pred:
+            pred_vec_logits = pred_vec_logits.detach()
+
+        reduction = self.occ_kl_reduction
+        if self.occ_kl_mode == 'kl':
+            if self.occ_kl_kind == 'categorical':
+                loss_val = _kl_categorical_from_logits(occ_vec_logits, pred_vec_logits, dim=-1, reduction=reduction)
+            else:
+                loss_val = _kl_bernoulli_from_logits(occ_vec_logits, pred_vec_logits, reduction=reduction)
+        elif self.occ_kl_mode == 'reverse_kl':
+            if self.occ_kl_kind == 'categorical':
+                loss_val = _kl_categorical_from_logits(pred_vec_logits, occ_vec_logits, dim=-1, reduction=reduction)
+            else:
+                loss_val = _kl_bernoulli_from_logits(pred_vec_logits, occ_vec_logits, reduction=reduction)
+        elif self.occ_kl_mode == 'symmetric_kl':
+            if self.occ_kl_kind == 'categorical':
+                loss_forward = _kl_categorical_from_logits(occ_vec_logits, pred_vec_logits, dim=-1, reduction=reduction)
+                loss_backward = _kl_categorical_from_logits(pred_vec_logits, occ_vec_logits, dim=-1, reduction=reduction)
+            else:
+                loss_forward = _kl_bernoulli_from_logits(occ_vec_logits, pred_vec_logits, reduction=reduction)
+                loss_backward = _kl_bernoulli_from_logits(pred_vec_logits, occ_vec_logits, reduction=reduction)
+            loss_val = 0.5 * (loss_forward + loss_backward)
+        elif self.occ_kl_mode == 'js':
+            if self.occ_kl_kind == 'categorical':
+                loss_val = _js_divergence_from_logits(occ_vec_logits, pred_vec_logits, kind='categorical', dim=-1, reduction=reduction)
+            else:
+                loss_val = _js_divergence_from_logits(occ_vec_logits, pred_vec_logits, kind='bernoulli', reduction=reduction)
+        else:
+            raise ValueError(f'Unsupported KL_MODE: {self.occ_kl_mode}')
+
+        return torch.nan_to_num(loss_val)
+
+    def _build_occ_class_mask(self, labels):
+        """Create boolean mask for classes supervised by occupancy."""
+        if labels is None:
+            return None
+        if self.occ_target_classes is None:
+            return torch.ones_like(labels, dtype=torch.bool)
+        mask = torch.zeros_like(labels, dtype=torch.bool)
+        for cls_id in self.occ_target_classes:
+            if cls_id < 0:
+                continue
+            mask |= (labels == cls_id)
+        return mask
 
     def _init_layers(self):
         """Initialize classification branch and regression branch of head."""
@@ -166,51 +389,66 @@ class BEVFormerHead(DETRHead):
                 cls_branches=self.cls_branches if self.as_two_stage else None,
                 img_metas=img_metas,
                 prev_bev=prev_bev
-        )
+            )
 
-        bev_embed, hs, init_reference, inter_references = outputs
-        hs = hs.permute(0, 2, 1, 3)
-        outputs_classes = []
-        outputs_coords = []
-        for lvl in range(hs.shape[0]):
-            if lvl == 0:
-                reference = init_reference
-            else:
-                reference = inter_references[lvl - 1]
-            reference = inverse_sigmoid(reference)
-            outputs_class = self.cls_branches[lvl](hs[lvl])
-            tmp = self.reg_branches[lvl](hs[lvl])
+            bev_embed, hs, init_reference, inter_references = outputs
+            hs = hs.permute(0, 2, 1, 3)
+            outputs_classes = []
+            outputs_coords = []
+            for lvl in range(hs.shape[0]):
+                if lvl == 0:
+                    reference = init_reference
+                else:
+                    reference = inter_references[lvl - 1]
+                reference = inverse_sigmoid(reference)
+                outputs_class = self.cls_branches[lvl](hs[lvl])
+                tmp = self.reg_branches[lvl](hs[lvl])
 
-            # TODO: check the shape of reference
-            assert reference.shape[-1] == 3
-            tmp[..., 0:2] += reference[..., 0:2]
-            tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
-            tmp[..., 4:5] += reference[..., 2:3]
-            tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
-            tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] -
-                             self.pc_range[0]) + self.pc_range[0])
-            tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] -
-                             self.pc_range[1]) + self.pc_range[1])
-            tmp[..., 4:5] = (tmp[..., 4:5] * (self.pc_range[5] -
-                             self.pc_range[2]) + self.pc_range[2])
+                # TODO: check the shape of reference
+                assert reference.shape[-1] == 3
+                tmp[..., 0:2] += reference[..., 0:2]
+                tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
+                tmp[..., 4:5] += reference[..., 2:3]
+                tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
+                tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] -
+                                 self.pc_range[0]) + self.pc_range[0])
+                tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] -
+                                 self.pc_range[1]) + self.pc_range[1])
+                tmp[..., 4:5] = (tmp[..., 4:5] * (self.pc_range[5] -
+                                 self.pc_range[2]) + self.pc_range[2])
 
-            # TODO: check if using sigmoid
-            outputs_coord = tmp
-            outputs_classes.append(outputs_class)
-            outputs_coords.append(outputs_coord)
+                # TODO: check if using sigmoid
+                outputs_coord = tmp
+                outputs_classes.append(outputs_class)
+                outputs_coords.append(outputs_coord)
 
-        outputs_classes = torch.stack(outputs_classes)
-        outputs_coords = torch.stack(outputs_coords)
+            outputs_classes = torch.stack(outputs_classes)
+            outputs_coords = torch.stack(outputs_coords)
 
-        outs = {
-            'bev_embed': bev_embed,
-            'all_cls_scores': outputs_classes,
-            'all_bbox_preds': outputs_coords,
-            'enc_cls_scores': None,
-            'enc_bbox_preds': None,
-        }
+            outs = {
+                'bev_embed': bev_embed,
+                'all_cls_scores': outputs_classes,
+                'all_bbox_preds': outputs_coords,
+                'enc_cls_scores': None,
+                'enc_bbox_preds': None,
+            }
 
-        return outs
+            # Optional occupancy logits from BEV feature
+            if self.with_occ:
+                B = mlvl_feats[0].shape[0]
+                # bev_embed returned from transformer has shape (H*W, B, C)
+                assert bev_embed.shape[0] == self.bev_h * self.bev_w, 'Unexpected BEV shape'
+                bev_feat = (
+                    bev_embed.permute(1, 0, 2)  # (B, H*W, C)
+                    .contiguous()
+                    .view(B, self.bev_h, self.bev_w, self.embed_dims)
+                    .permute(0, 3, 1, 2)
+                    .contiguous()
+                )
+                occ_logits = self.occ_head(bev_feat)  # (B, {1|C}, H, W)
+                outs['occ_logits'] = occ_logits
+
+            return outs
 
     def _get_target_single(self,
                            cls_score,
@@ -477,7 +715,232 @@ class BEVFormerHead(DETRHead):
             loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
             loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
             num_dec_layer += 1
+        # Occupancy auxiliary loss
+        if self.with_occ and 'occ_logits' in preds_dicts:
+            occ_logits = preds_dicts['occ_logits']  # (B,{1|C},H,W)
+            if self.occ_per_class:
+                with torch.no_grad():
+                    occ_targets, occ_weights = self._build_occ_targets_per_class(gt_bboxes_list, gt_labels_list, device=occ_logits.device)  # (B,C,H,W)
+                # compute pos/neg using weights (ignored cells have weight 0)
+                B, C, H, W = occ_targets.shape
+                weight_sum = occ_weights.sum(dim=(0, 2, 3)).clamp(min=1e-6)  # (C,)
+                pos = (occ_targets.float() * occ_weights).sum(dim=(0, 2, 3))  # (C,)
+                neg = weight_sum - pos
+                pos_weight = torch.where(pos > 0, neg / pos.clamp(min=1.0), torch.ones_like(pos))
+                pw = pos_weight.view(1, C, 1, 1)
+                bce = F.binary_cross_entropy_with_logits(
+                    occ_logits,
+                    occ_targets.float(),
+                    pos_weight=pw,
+                    weight=occ_weights,
+                    reduction='sum')
+                norm = occ_weights.sum().clamp(min=1.0)
+                occ_loss = bce / norm
+                loss_dict['loss_occ'] = occ_loss * self.occ_loss_weight
+                # optional: log per-class positive ratios among unmasked cells
+                for ci in range(min(3, occ_targets.shape[1])):  # log first few to avoid spam
+                    loss_dict[f'occ_pos_c{ci}'] = pos[ci] / weight_sum[ci]
+            else:
+                with torch.no_grad():
+                    occ_targets, occ_weights = self._build_occ_targets(gt_bboxes_list, gt_labels_list, device=occ_logits.device)  # (B,H,W)
+                pos = (occ_targets.float() * occ_weights).sum()
+                weight_sum = occ_weights.sum().clamp(min=1.0)
+                neg = weight_sum - pos
+                pos_weight = 1.0 if pos.item() == 0 else float(neg / pos.clamp(min=1.0))
+                pw = torch.tensor(pos_weight, device=occ_logits.device)
+                bce = F.binary_cross_entropy_with_logits(
+                    occ_logits.squeeze(1),
+                    occ_targets.float(),
+                    pos_weight=pw,
+                    weight=occ_weights,
+                    reduction='sum')
+                occ_loss = bce / weight_sum
+                loss_dict['loss_occ'] = occ_loss * self.occ_loss_weight
+
+            if self.occ_kl_enabled:
+                kl_val = self._compute_occ_pred_kl(occ_logits, preds_dicts)
+                if kl_val is not None:
+                    loss_dict['loss_occ_pred_kl'] = kl_val * self.occ_kl_weight
+
         return loss_dict
+
+    def _build_occ_targets(self, gt_bboxes_list, gt_labels_list=None, device=None):
+        """Build BEV occupancy targets and weights.
+
+        - targets: (B, H, W) bool, 1 if a target-class box occupies the cell.
+        - weights: (B, H, W) float, 0 means ignore in loss. Cells covered *only* by
+            non-target classes are ignored (weight=0) instead of treated as negatives.
+        """
+        bs = len(gt_bboxes_list)
+        H, W = self.bev_h, self.bev_w
+        x_min, y_min, _, x_max, y_max, _ = self.pc_range
+        dx = (x_max - x_min) / W
+        dy = (y_max - y_min) / H
+        x_centers = torch.linspace(x_min + dx/2, x_max - dx/2, W, device=device)
+        y_centers = torch.linspace(y_min + dy/2, y_max - dy/2, H, device=device)
+        grid_y, grid_x = torch.meshgrid(y_centers, x_centers)  # (H,W)
+        pts = torch.stack([grid_x, grid_y], dim=-1).view(-1, 2)  # (H*W,2)
+        targets, weights = [], []
+        for i in range(bs):
+            item = gt_bboxes_list[i]
+            labels = gt_labels_list[i] if gt_labels_list is not None else None
+            if labels is not None:
+                labels = labels.to(device)
+            if hasattr(item, 'tensor') and hasattr(item, 'gravity_center'):
+                gtb = torch.cat((item.gravity_center, item.tensor[:, 3:]), dim=1).to(device)
+            elif torch.is_tensor(item):
+                gtb = item.to(device)
+            else:
+                gtb = torch.empty((0, 7), device=device)
+
+            occ_target = torch.zeros(pts.shape[0], device=device, dtype=torch.bool)
+            occ_excluded = torch.zeros_like(occ_target)
+
+            if gtb.numel() > 0:
+                # split into target-class boxes and excluded boxes
+                class_mask = self._build_occ_class_mask(labels)
+                if class_mask is not None:
+                    # target boxes
+                    if class_mask.any():
+                        gtb_t = gtb[class_mask]
+                    else:
+                        gtb_t = torch.empty((0, 7), device=device)
+                    # non-target boxes
+                    gtb_nt = gtb[~class_mask] if class_mask.numel() else torch.empty((0, 7), device=device)
+                else:
+                    gtb_t = gtb
+                    gtb_nt = torch.empty((0, 7), device=device)
+
+                def _mark_occ(boxes):
+                    if boxes.numel() == 0:
+                        return torch.zeros_like(occ_target)
+                    cx = boxes[:, 0:1]
+                    cy = boxes[:, 1:2]
+                    dx_box = boxes[:, 3:4]
+                    dy_box = boxes[:, 4:5]
+                    yaw = boxes[:, 6:7]
+                    cos_y = torch.cos(yaw)
+                    sin_y = torch.sin(yaw)
+                    p = pts[None, :, :]  # (1,P,2)
+                    pcx = p[..., 0] - cx  # (N,P)
+                    pcy = p[..., 1] - cy
+                    x_loc = cos_y * pcx + sin_y * pcy
+                    y_loc = -sin_y * pcx + cos_y * pcy
+                    in_box = (x_loc.abs() <= dx_box/2) & (y_loc.abs() <= dy_box/2)  # (N,P)
+                    return in_box.any(dim=0)
+
+                occ_target = _mark_occ(gtb_t)
+                occ_excluded = _mark_occ(gtb_nt)
+
+            # weight=0 only for cells covered by non-target boxes and not by target boxes
+            w = torch.ones_like(occ_target, dtype=torch.float)
+            w[(occ_excluded & (~occ_target))] = 0.0
+            targets.append(occ_target)
+            weights.append(w)
+
+        targets = torch.stack(targets, dim=0).view(bs, H, W)
+        weights = torch.stack(weights, dim=0).view(bs, H, W)
+        return targets, weights
+
+    def _build_occ_targets_per_class(self, gt_bboxes_list, gt_labels_list, device):
+        """Build per-class BEV occupancy targets and weights.
+
+        Returns:
+            targets: (B, C, H, W) bool, per-class occupancy for target classes.
+            weights: (B, C, H, W) float, 0 to ignore cells occupied only by non-target classes.
+        """
+        bs = len(gt_bboxes_list)
+        H, W = self.bev_h, self.bev_w
+        C = getattr(self, 'num_classes', 1)
+        x_min, y_min, _, x_max, y_max, _ = self.pc_range
+        dx = (x_max - x_min) / W
+        dy = (y_max - y_min) / H
+        x_centers = torch.linspace(x_min + dx/2, x_max - dx/2, W, device=device)
+        y_centers = torch.linspace(y_min + dy/2, y_max - dy/2, H, device=device)
+        grid_y, grid_x = torch.meshgrid(y_centers, x_centers)  # (H,W)
+        pts = torch.stack([grid_x, grid_y], dim=-1).view(-1, 2)  # (H*W,2)
+        batch_targets, batch_weights = [] , []
+        for i in range(bs):
+            item = gt_bboxes_list[i]
+            labels = gt_labels_list[i].to(device)
+            if hasattr(item, 'tensor') and hasattr(item, 'gravity_center'):
+                gtb = torch.cat((item.gravity_center, item.tensor[:, 3:]), dim=1).to(device)
+            elif torch.is_tensor(item):
+                gtb = item.to(device)
+            else:
+                gtb = torch.empty((0, 7), device=device)
+
+            # prepare splits
+            class_mask = self._build_occ_class_mask(labels)
+            if class_mask is not None:
+                gtb_t = gtb[class_mask] if class_mask.any() else torch.empty((0, 7), device=device)
+                labels_t = labels[class_mask] if class_mask.any() else torch.empty((0,), device=device, dtype=labels.dtype)
+                gtb_nt = gtb[~class_mask] if class_mask.numel() else torch.empty((0, 7), device=device)
+            else:
+                gtb_t = gtb
+                labels_t = labels
+                gtb_nt = torch.empty((0, 7), device=device)
+
+            def _mark_occ(boxes):
+                if boxes.numel() == 0:
+                    return torch.zeros(C, pts.shape[0], device=device, dtype=torch.bool)
+                cx = boxes[:, 0:1]
+                cy = boxes[:, 1:2]
+                dx_box = boxes[:, 3:4]
+                dy_box = boxes[:, 4:5]
+                yaw = boxes[:, 6:7]
+                cos_y = torch.cos(yaw)
+                sin_y = torch.sin(yaw)
+                p = pts[None, :, :]  # (1,P,2)
+                pcx = p[..., 0] - cx  # (N,P)
+                pcy = p[..., 1] - cy
+                x_loc = cos_y * pcx + sin_y * pcy
+                y_loc = -sin_y * pcx + cos_y * pcy
+                in_box = (x_loc.abs() <= dx_box/2) & (y_loc.abs() <= dy_box/2)  # (N,P)
+                occ = torch.zeros(C, in_box.shape[1], device=device, dtype=torch.bool)
+                target_classes = self.occ_target_classes if self.occ_target_classes is not None else range(C)
+                for c in target_classes:
+                    if c < 0 or c >= C or labels_t.numel() == 0:
+                        continue
+                    mask = (labels_t == c)
+                    if mask.any():
+                        occ[c] = in_box[mask].any(dim=0)
+                return occ
+
+            cls_occ = _mark_occ(gtb_t)
+
+            # excluded occupancy (non-target boxes) -> used to mask out
+            def _mark_any(boxes):
+                if boxes.numel() == 0:
+                    return torch.zeros(pts.shape[0], device=device, dtype=torch.bool)
+                cx = boxes[:, 0:1]
+                cy = boxes[:, 1:2]
+                dx_box = boxes[:, 3:4]
+                dy_box = boxes[:, 4:5]
+                yaw = boxes[:, 6:7]
+                cos_y = torch.cos(yaw)
+                sin_y = torch.sin(yaw)
+                p = pts[None, :, :]
+                pcx = p[..., 0] - cx
+                pcy = p[..., 1] - cy
+                x_loc = cos_y * pcx + sin_y * pcy
+                y_loc = -sin_y * pcx + cos_y * pcy
+                in_box = (x_loc.abs() <= dx_box/2) & (y_loc.abs() <= dy_box/2)
+                return in_box.any(dim=0)
+
+            occ_excluded = _mark_any(gtb_nt)
+            occ_target_any = cls_occ.any(dim=0)
+
+            w = torch.ones_like(cls_occ, dtype=torch.float)
+            ignore_mask = occ_excluded & (~occ_target_any)
+            w[:, ignore_mask] = 0.0
+
+            batch_targets.append(cls_occ)
+            batch_weights.append(w)
+
+        targets = torch.stack(batch_targets, dim=0).view(bs, C, H, W)
+        weights = torch.stack(batch_weights, dim=0).view(bs, C, H, W)
+        return targets, weights
 
     @force_fp32(apply_to=('preds_dicts'))
     def get_bboxes(self, preds_dicts, img_metas, rescale=False):

@@ -3,6 +3,7 @@
 #  Modified by Zhiqi Li
 # ---------------------------------------------
 
+import os
 import mmcv
 from nuscenes.nuscenes import NuScenes
 from PIL import Image
@@ -348,6 +349,40 @@ def get_color(category_name: str):
     return [0, 0, 0]
 
 
+def _resolve_img_path(base_path: str):
+    """Return an existing image path, trying with and without '.png'."""
+    if os.path.isfile(base_path):
+        return base_path
+    png_path = base_path + '.png'
+    if os.path.isfile(png_path):
+        return png_path
+    return None
+
+
+def combine_occ_bev(out_path: str, occ_dir: str = 'work_dirs/occ_maps'):
+    """Combine occupancy heatmap and BEV image into one side-by-side figure."""
+    if not out_path:
+        return
+    base_name = os.path.basename(out_path)
+    bev_path = _resolve_img_path(f"{out_path}_bev")
+    occ_path = os.path.join(occ_dir, f"{base_name}_occ.png")
+    if bev_path is None or not os.path.isfile(occ_path):
+        return
+    bev_img = Image.open(bev_path).convert('RGB')
+    occ_img = Image.open(occ_path).convert('RGB')
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    axes[0].imshow(occ_img)
+    axes[0].axis('off')
+    axes[0].set_title('Occupancy')
+    axes[1].imshow(bev_img)
+    axes[1].axis('off')
+    axes[1].set_title('BEV')
+    plt.tight_layout()
+    combined_path = f"{out_path}_bev_occ.png"
+    plt.savefig(combined_path, dpi=150)
+    plt.close(fig)
+
+
 def render_sample_data(
         sample_toekn: str,
         with_anns: bool = True,
@@ -467,11 +502,13 @@ def render_sample_data(
     if verbose:
         plt.show()
     plt.close()
+    if out_path is not None:
+        combine_occ_bev(out_path)
 
 if __name__ == '__main__':
     nusc = NuScenes(version='v1.0-trainval', dataroot='./data/nuscenes', verbose=True)
     # render_annotation('7603b030b42a4b1caa8c443ccc1a7d52')
-    bevformer_results = mmcv.load('test/bevformer_base/Thu_Jun__9_16_22_37_2022/pts_bbox/results_nusc.json')
+    bevformer_results = mmcv.load('/data/code/BEVFormer/test/bevformer_small_occ_1:2/latest/pts_bbox/results_nusc.json')
     sample_token_list = list(bevformer_results['results'].keys())
     for id in range(0, 10):
         render_sample_data(sample_token_list[id], pred_data=bevformer_results, out_path=sample_token_list[id])

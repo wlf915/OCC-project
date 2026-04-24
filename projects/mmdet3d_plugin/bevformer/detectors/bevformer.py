@@ -272,6 +272,55 @@ class BEVFormer(MVXTwoStageDetector):
         """Test function"""
         outs = self.pts_bbox_head(x, img_metas, prev_bev=prev_bev)
 
+        # If occupancy logits are present, convert to probabilities and save
+        # per-sample under `work_dirs/occ_maps/` as .npy and a heatmap .png
+        try:
+            occ_logits = outs.get('occ_logits', None)
+            if occ_logits is not None:
+                import os
+                import numpy as np
+                import matplotlib.pyplot as plt
+                from mmcv import mkdir_or_exist
+
+                out_dir = os.path.join('work_dirs', 'occ_maps')
+                mkdir_or_exist(out_dir)
+
+                # occ_logits shape: (B, C|1, H, W)
+                occ_probs = torch.sigmoid(occ_logits).detach().cpu().numpy()
+                B = occ_probs.shape[0]
+                for i in range(B):
+                    meta = img_metas[i] if i < len(img_metas) else {}
+                    # try sample identifier keys then fallback to index
+                    sid = None
+                    for key in ('sample_token', 'sample_idx', 'scene_token', 'frame_id'):
+                        if isinstance(meta, dict) and key in meta:
+                            sid = meta[key]
+                            break
+                    if sid is None:
+                        sid = str(i)
+
+                    npy_path = os.path.join(out_dir, f"{sid}_occ.npy")
+                    np.save(npy_path, occ_probs[i])
+
+                    # save a simple heatmap for the first channel
+                    heat = occ_probs[i]
+                    # if multiple channels, take mean across channel dim
+                    if heat.ndim == 3:
+                        heatmap = heat.mean(axis=0)
+                    else:
+                        heatmap = heat
+                    png_path = os.path.join(out_dir, f"{sid}_occ.png")
+                    plt.figure(figsize=(6,6))
+                    plt.imshow(heatmap, origin='lower', cmap='hot')
+                    plt.colorbar()
+                    plt.title(f"occ heatmap {sid}")
+                    plt.tight_layout()
+                    plt.savefig(png_path, dpi=150)
+                    plt.close()
+        except Exception:
+            # don't break inference on save errors
+            pass
+
         bbox_list = self.pts_bbox_head.get_bboxes(
             outs, img_metas, rescale=rescale)
         bbox_results = [

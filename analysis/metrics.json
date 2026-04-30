@@ -1,0 +1,11 @@
+{
+  "num_pairs": 2213,
+  "num_common_tokens": 1113,
+  "skipped": {},
+  "k": 8,
+  "seed": 42,
+  "ari_cluster_with_vs_no": 0.1730966162922779,
+  "nmi_cluster_with_vs_no": 0.2150902523447311,
+  "pairwise_cosine_mean": -0.015003160565715152,
+  "center_cosine_mean": 0.006917096221221185
+}

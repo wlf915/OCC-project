@@ -5,6 +5,8 @@
 # ---------------------------------------------
 
 import torch
+import os
+import json
 from mmcv.runner import force_fp32, auto_fp16
 from mmdet.models import DETECTORS
 from mmdet3d.core import bbox3d2result
@@ -14,6 +16,7 @@ import time
 import copy
 import numpy as np
 import mmdet3d
+from mmcv import mkdir_or_exist
 from projects.mmdet3d_plugin.models.utils.bricks import run_time
 
 
@@ -62,6 +65,181 @@ class BEVFormer(MVXTwoStageDetector):
             'prev_pos': 0,
             'prev_angle': 0,
         }
+
+        self.analysis_export_cfg = self._build_analysis_export_cfg()
+
+    def _build_analysis_export_cfg(self):
+        enabled = os.getenv('BEVFORMER_EXPORT_ANALYSIS', '0') == '1'
+        out_dir = os.getenv('BEVFORMER_EXPORT_DIR', os.path.join('artifacts', 'analysis_export'))
+        save_occ = os.getenv('BEVFORMER_EXPORT_OCC', '1') == '1'
+        save_bev = os.getenv('BEVFORMER_EXPORT_BEV', '1') == '1'
+        save_cls = os.getenv('BEVFORMER_EXPORT_CLS', '1') == '1'
+        save_pred = os.getenv('BEVFORMER_EXPORT_PRED', '1') == '1'
+        dtype = os.getenv('BEVFORMER_EXPORT_DTYPE', 'float16').lower()
+
+        cfg = getattr(self, 'test_cfg', None)
+        if isinstance(cfg, dict):
+            export_cfg = cfg.get('analysis_export', None)
+            if isinstance(export_cfg, dict):
+                enabled = bool(export_cfg.get('enabled', enabled))
+                out_dir = export_cfg.get('out_dir', out_dir)
+                save_occ = bool(export_cfg.get('save_occ', save_occ))
+                save_bev = bool(export_cfg.get('save_bev', save_bev))
+                save_cls = bool(export_cfg.get('save_cls', save_cls))
+                save_pred = bool(export_cfg.get('save_pred', save_pred))
+                dtype = str(export_cfg.get('dtype', dtype)).lower()
+
+        if dtype not in ('float16', 'float32'):
+            dtype = 'float16'
+
+        return dict(
+            enabled=enabled,
+            out_dir=out_dir,
+            save_occ=save_occ,
+            save_bev=save_bev,
+            save_cls=save_cls,
+            save_pred=save_pred,
+            dtype=dtype,
+        )
+
+    def _get_rank(self):
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank()
+        return 0
+
+    def _safe_sample_id(self, meta, fallback_idx):
+        sid = None
+        if isinstance(meta, dict):
+            for key in ('sample_token', 'sample_idx', 'scene_token', 'frame_id'):
+                if key in meta:
+                    sid = str(meta[key])
+                    break
+        if sid is None:
+            sid = str(fallback_idx)
+        sid = sid.replace('/', '_')
+        return sid
+
+    def _append_jsonl(self, path, obj):
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + '\n')
+
+    def _save_analysis_artifacts(self, outs, bbox_list, img_metas):
+        cfg = self.analysis_export_cfg
+        if not cfg.get('enabled', False):
+            return
+
+        try:
+            rank = self._get_rank()
+            root_dir = cfg['out_dir']
+            occ_dir = os.path.join(root_dir, 'occ')
+            bev_dir = os.path.join(root_dir, 'bev')
+            cls_dir = os.path.join(root_dir, 'cls')
+            pred_dir = os.path.join(root_dir, 'pred')
+            meta_dir = os.path.join(root_dir, 'meta')
+            mkdir_or_exist(root_dir)
+            mkdir_or_exist(meta_dir)
+            if cfg.get('save_occ', True):
+                mkdir_or_exist(occ_dir)
+            if cfg.get('save_bev', True):
+                mkdir_or_exist(bev_dir)
+            if cfg.get('save_cls', True):
+                mkdir_or_exist(cls_dir)
+            if cfg.get('save_pred', True):
+                mkdir_or_exist(pred_dir)
+
+            np_dtype = np.float16 if cfg.get('dtype') == 'float16' else np.float32
+
+            occ_probs = None
+            occ_logits = outs.get('occ_logits', None)
+            if occ_logits is not None:
+                occ_probs = torch.sigmoid(occ_logits).detach().cpu().numpy().astype(np_dtype)
+
+            bev_embed = outs.get('bev_embed', None)
+            bev_feat = None
+            if bev_embed is not None:
+                bev_embed = bev_embed.detach().float()
+                if bev_embed.dim() == 3:
+                    if bev_embed.shape[0] == self.pts_bbox_head.bev_h * self.pts_bbox_head.bev_w:
+                        bev_feat = (
+                            bev_embed.permute(1, 0, 2)
+                            .contiguous()
+                            .view(
+                                bev_embed.shape[1],
+                                self.pts_bbox_head.bev_h,
+                                self.pts_bbox_head.bev_w,
+                                self.pts_bbox_head.embed_dims,
+                            )
+                            .permute(0, 3, 1, 2)
+                            .contiguous()
+                        )
+                    elif bev_embed.shape[1] == self.pts_bbox_head.bev_h * self.pts_bbox_head.bev_w:
+                        bev_feat = (
+                            bev_embed.contiguous()
+                            .view(
+                                bev_embed.shape[0],
+                                self.pts_bbox_head.bev_h,
+                                self.pts_bbox_head.bev_w,
+                                bev_embed.shape[2],
+                            )
+                            .permute(0, 3, 1, 2)
+                            .contiguous()
+                        )
+            bev_np = None if bev_feat is None else bev_feat.detach().cpu().numpy().astype(np_dtype)
+
+            cls_last = None
+            all_cls_scores = outs.get('all_cls_scores', None)
+            if all_cls_scores is not None:
+                cls_last = all_cls_scores[-1].detach().cpu().numpy().astype(np_dtype)
+
+            meta_path = os.path.join(meta_dir, f'meta_rank{rank}.jsonl')
+
+            for i, meta in enumerate(img_metas):
+                sid = self._safe_sample_id(meta, i)
+                record = {
+                    'sample_id': sid,
+                    'rank': rank,
+                    'index_in_batch': i,
+                    'paths': {},
+                }
+                if isinstance(meta, dict):
+                    record['meta'] = {
+                        'sample_token': meta.get('sample_token', None),
+                        'sample_idx': meta.get('sample_idx', None),
+                        'scene_token': meta.get('scene_token', None),
+                        'frame_id': meta.get('frame_id', None),
+                        'timestamp': meta.get('timestamp', None),
+                    }
+
+                if cfg.get('save_occ', True) and occ_probs is not None and i < occ_probs.shape[0]:
+                    occ_path = os.path.join(occ_dir, f'{sid}_occ.npy')
+                    np.save(occ_path, occ_probs[i])
+                    record['paths']['occ'] = occ_path
+
+                if cfg.get('save_bev', True) and bev_np is not None and i < bev_np.shape[0]:
+                    bev_path = os.path.join(bev_dir, f'{sid}_bev.npy')
+                    np.save(bev_path, bev_np[i])
+                    record['paths']['bev'] = bev_path
+
+                if cfg.get('save_cls', True) and cls_last is not None and i < cls_last.shape[0]:
+                    cls_path = os.path.join(cls_dir, f'{sid}_cls_last.npy')
+                    np.save(cls_path, cls_last[i])
+                    record['paths']['cls_last'] = cls_path
+
+                if cfg.get('save_pred', True) and i < len(bbox_list):
+                    bboxes, scores, labels = bbox_list[i]
+                    box_path = os.path.join(pred_dir, f'{sid}_boxes.npy')
+                    score_path = os.path.join(pred_dir, f'{sid}_scores.npy')
+                    label_path = os.path.join(pred_dir, f'{sid}_labels.npy')
+                    np.save(box_path, bboxes.tensor.detach().cpu().numpy().astype(np_dtype))
+                    np.save(score_path, scores.detach().cpu().numpy().astype(np_dtype))
+                    np.save(label_path, labels.detach().cpu().numpy().astype(np.int64))
+                    record['paths']['boxes'] = box_path
+                    record['paths']['scores'] = score_path
+                    record['paths']['labels'] = label_path
+
+                self._append_jsonl(meta_path, record)
+        except Exception:
+            pass
 
 
     def extract_img_feat(self, img, img_metas, len_queue=None):
@@ -273,15 +451,12 @@ class BEVFormer(MVXTwoStageDetector):
         outs = self.pts_bbox_head(x, img_metas, prev_bev=prev_bev)
 
         # If occupancy logits are present, convert to probabilities and save
-        # per-sample under `work_dirs/occ_maps/` as .npy and a heatmap .png
+        # per-sample under `work_dirs/occ_maps/` as .npy.
+        # The heatmap visualization is intentionally kept out of inference and
+        # can be generated later from the saved arrays.
         try:
             occ_logits = outs.get('occ_logits', None)
             if occ_logits is not None:
-                import os
-                import numpy as np
-                import matplotlib.pyplot as plt
-                from mmcv import mkdir_or_exist
-
                 out_dir = os.path.join('work_dirs', 'occ_maps')
                 mkdir_or_exist(out_dir)
 
@@ -301,28 +476,15 @@ class BEVFormer(MVXTwoStageDetector):
 
                     npy_path = os.path.join(out_dir, f"{sid}_occ.npy")
                     np.save(npy_path, occ_probs[i])
-
-                    # save a simple heatmap for the first channel
-                    heat = occ_probs[i]
-                    # if multiple channels, take mean across channel dim
-                    if heat.ndim == 3:
-                        heatmap = heat.mean(axis=0)
-                    else:
-                        heatmap = heat
-                    png_path = os.path.join(out_dir, f"{sid}_occ.png")
-                    plt.figure(figsize=(6,6))
-                    plt.imshow(heatmap, origin='lower', cmap='hot')
-                    plt.colorbar()
-                    plt.title(f"occ heatmap {sid}")
-                    plt.tight_layout()
-                    plt.savefig(png_path, dpi=150)
-                    plt.close()
         except Exception:
             # don't break inference on save errors
             pass
 
         bbox_list = self.pts_bbox_head.get_bboxes(
             outs, img_metas, rescale=rescale)
+
+        self._save_analysis_artifacts(outs, bbox_list, img_metas)
+
         bbox_results = [
             bbox3d2result(bboxes, scores, labels)
             for bboxes, scores, labels in bbox_list

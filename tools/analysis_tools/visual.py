@@ -359,19 +359,61 @@ def _resolve_img_path(base_path: str):
     return None
 
 
+def _load_occ_heatmap(occ_path: str, reduction: str = 'mean'):
+    """Load an occ tensor from .npy and reduce it to a 2D heatmap."""
+    occ = np.load(occ_path)
+    if occ.ndim == 2:
+        return occ
+    if occ.ndim == 3:
+        if occ.shape[0] == 1:
+            return occ[0]
+        if reduction == 'first':
+            return occ[0]
+        if reduction == 'max':
+            return occ.max(axis=0)
+        return occ.mean(axis=0)
+    raise ValueError(f'Unsupported occ shape: {occ.shape} from {occ_path}')
+
+
+def save_occ_heatmap(occ_path: str,
+                     out_path: str = None,
+                     cmap: str = 'hot',
+                     reduction: str = 'mean',
+                     dpi: int = 150):
+    """Render a single occ.npy file to a PNG heatmap."""
+    if not occ_path or not os.path.isfile(occ_path):
+        return None
+    heatmap = _load_occ_heatmap(occ_path, reduction=reduction)
+    if out_path is None:
+        out_path = os.path.splitext(occ_path)[0] + '.png'
+    fig = plt.figure(figsize=(6, 6))
+    plt.imshow(heatmap, origin='lower', cmap=cmap)
+    plt.colorbar()
+    plt.title(os.path.basename(out_path))
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    return out_path
+
+
 def combine_occ_bev(out_path: str, occ_dir: str = 'work_dirs/occ_maps'):
     """Combine occupancy heatmap and BEV image into one side-by-side figure."""
     if not out_path:
         return
     base_name = os.path.basename(out_path)
     bev_path = _resolve_img_path(f"{out_path}_bev")
-    occ_path = os.path.join(occ_dir, f"{base_name}_occ.png")
-    if bev_path is None or not os.path.isfile(occ_path):
+    occ_png_path = os.path.join(occ_dir, f"{base_name}_occ.png")
+    occ_npy_path = os.path.join(occ_dir, f"{base_name}_occ.npy")
+    if bev_path is None or (not os.path.isfile(occ_png_path) and not os.path.isfile(occ_npy_path)):
         return
     bev_img = Image.open(bev_path).convert('RGB')
-    occ_img = Image.open(occ_path).convert('RGB')
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-    axes[0].imshow(occ_img)
+    if os.path.isfile(occ_png_path):
+        occ_img = Image.open(occ_png_path).convert('RGB')
+        axes[0].imshow(occ_img)
+    else:
+        occ_heatmap = _load_occ_heatmap(occ_npy_path)
+        axes[0].imshow(occ_heatmap, origin='lower', cmap='hot')
     axes[0].axis('off')
     axes[0].set_title('Occupancy')
     axes[1].imshow(bev_img)
